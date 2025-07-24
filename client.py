@@ -2,7 +2,9 @@ import socket
 import struct
 import threading
 import time
-import zlib # For decompressing chunk data
+import zlib
+import signal # Import the signal module
+import sys    # Import sys for sys.exit()
 
 # === Configuration ===
 SERVER_HOST = "mc.evilduckz.net"
@@ -10,18 +12,45 @@ SERVER_PORT = 25565
 USERNAME = "TestBot"
 
 # === Global State (for player position/look) ===
-# We need to maintain the bot's known position/look to send back to the server.
-bot_x, bot_y, bot_z = 0.0, 64.0, 0.0 # Initial reasonable defaults
-bot_stance = bot_y + 1.62 # Stance is typically player_y + 1.62 (eye level)
+bot_x, bot_y, bot_z = 0.0, 64.0, 0.0
+bot_stance = bot_y + 1.62
 bot_yaw, bot_pitch = 0.0, 0.0
 bot_on_ground = False
-bot_entity_id = -1 # Will be set by 0x01 Login Success
+bot_entity_id = -1
+
+# === Global Socket Variable ===
+# Make the socket accessible globally or pass it to the signal handler
+# We'll use a global variable for simplicity in this example.
+global_socket = None
+
+# === Signal Handler for graceful shutdown ===
+def signal_handler(sig, frame):
+    global global_socket
+    print("\n[INFO] Ctrl+C detected. Attempting graceful shutdown...")
+    if global_socket:
+        try:
+            # Send Disconnect packet (0xFF)
+            disconnect_message = "Disconnected by client (Ctrl+C)"
+            disconnect_data = encode_string_utf16(disconnect_message)
+            send_packet(global_socket, 0xFF, disconnect_data)
+            print(f"[Send] Sent 0xFF Disconnect packet: '{disconnect_message}'")
+            # Give a small moment for the packet to send
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"[ERROR] Failed to send disconnect packet: {e}")
+        finally:
+            print("[INFO] Closing socket.")
+            global_socket.close()
+    sys.exit(0) # Exit the program gracefully
+
+# Register the signal handler
+signal.signal(signal.SIGINT, signal_handler)
 
 # === Helper Functions ===
 def debug_send(sock, data):
     """Sends raw bytes over the socket."""
     # print(f"[RawSend] {len(data)} bytes: {data.hex()}")
-    sock.sendall(data) # Use sendall to ensure all bytes are sent
+    sock.sendall(data)
 
 def send_packet(sock, packet_id, data=b''):
     """Constructs and sends a Minecraft packet."""
@@ -56,7 +85,10 @@ def read_string_utf16(sock):
     """Reads a Minecraft UCS-2 (UTF-16BE) string from the socket."""
     length_bytes = recv_exact(sock, 2)
     length = struct.unpack('>h', length_bytes)[0]
-    raw = recv_exact(sock, length * 2) # Length in characters, each char is 2 bytes
+    if length < 0:
+        print(f"[ERROR] Attempted to read string with negative length: {length}. Possible desync.")
+        raise ValueError(f"Negative string length: {length}") # Or return "" and log
+    raw = recv_exact(sock, length * 2)
     return raw.decode('utf-16be')
 
 # --- Metadata Handling ---
@@ -92,8 +124,6 @@ def read_metadata(sock):
             value = {'x': x, 'y': y, 'z': z}
         else:
             print(f"[WARN] Unknown metadata type {data_type} for index {index}. Skipping unknown bytes (may cause desync).")
-            # For unhandled types, you'd need to guess how many bytes to skip.
-            # This is dangerous. Raise an error to force an update.
             raise RuntimeError(f"Unhandled metadata type: {data_type} for metadata field 0x{x:02X}")
         
         metadata[index] = {'type': data_type, 'value': value}
@@ -188,10 +218,9 @@ def handle_server(sock):
                 # Spawn Position (Server to Client only)
                 x, y, z = struct.unpack('>iii', recv_exact(sock, 12))
                 print(f"[SpawnPosition] X: {x}, Y: {y}, Z: {z}")
-                # Update bot's internal position for future movement packets
                 bot_x, bot_y, bot_z = float(x), float(y), float(z)
-                bot_stance = bot_y + 1.62 # Update stance based on new Y
-                bot_on_ground = True # Assume on ground at spawn
+                bot_stance = bot_y + 1.62
+                bot_on_ground = True
 
             elif pid == 0x07:
                 # Use Entity (Client to Server only - if received, it's unexpected)
@@ -229,7 +258,6 @@ def handle_server(sock):
 
             elif pid == 0x0D:
                 # Player Position Look (Server to Client)
-                # Server sends X, Stance, Y, Z for its position.
                 x, stance, y, z = struct.unpack('>dddd', recv_exact(sock, 32)) 
                 yaw, pitch = struct.unpack('>ff', recv_exact(sock, 8))
                 on_ground = struct.unpack('>?', recv_exact(sock, 1))[0]
@@ -241,9 +269,6 @@ def handle_server(sock):
                 bot_yaw, bot_pitch = yaw, pitch
                 bot_on_ground = on_ground
 
-                # Client needs to respond with its own 0x0D with X, Y, Stance, Z order.
-                # The documentation states: "When you connect to the official server, it will push a 0x0D packet. If you do not immediately respond with a 0x0D (or maybe 0x0A-0x0C) packet with similar and valid information, it will have unexpected results, such as map chunks not loading and future 0x0A-0x0D packets being ignored."
-                # Sending 0x0D back is the most robust response here.
                 response_data = struct.pack('>ddddff?', bot_x, bot_y, bot_stance, bot_z, bot_yaw, bot_pitch, bot_on_ground)
                 send_packet(sock, 0x0D, response_data)
 
@@ -281,7 +306,7 @@ def handle_server(sock):
                 eid = struct.unpack('>i', recv_exact(sock, 4))[0]
                 in_bed_status = struct.unpack('>b', recv_exact(sock, 1))[0]
                 x = struct.unpack('>i', recv_exact(sock, 4))[0]
-                y = struct.unpack('>b', recv_exact(sock, 1))[0] # Y is a byte here
+                y = struct.unpack('>b', recv_exact(sock, 1))[0]
                 z = struct.unpack('>i', recv_exact(sock, 4))[0]
                 print(f"[UseBed] EID: {eid}, InBedStatus: {in_bed_status}, X: {x}, Y: {y}, Z: {z}")
             
@@ -304,7 +329,7 @@ def handle_server(sock):
                 x, y, z = struct.unpack('>iii', recv_exact(sock, 12))
                 yaw, pitch = struct.unpack('>bb', recv_exact(sock, 2))
                 current_item = struct.unpack('>h', recv_exact(sock, 2))[0]
-                # metadata = read_metadata(sock) # REMOVE THIS LINE!
+                # REMOVED: metadata = read_metadata(sock) # THIS LINE WAS THE PROBLEM
                 print(f"[SpawnNamedEntity] EID: {eid}, Name: '{player_name}', X:{x}, Y:{y}, Z:{z}, Yaw:{yaw}, Pitch:{pitch}, Item:{current_item}")
 
             elif pid == 0x15:
@@ -312,7 +337,7 @@ def handle_server(sock):
                 eid = struct.unpack('>i', recv_exact(sock, 4))[0]
                 item_id = struct.unpack('>h', recv_exact(sock, 2))[0]
                 count = struct.unpack('>b', recv_exact(sock, 1))[0]
-                damage = struct.unpack('>h', recv_exact(sock, 2))[0] # This is also for metadata
+                damage = struct.unpack('>h', recv_exact(sock, 2))[0]
                 x, y, z = struct.unpack('>iii', recv_exact(sock, 12))
                 yaw, pitch, roll = struct.unpack('>bbb', recv_exact(sock, 3))
                 print(f"[PickupSpawn] EID: {eid}, ItemID: {item_id}, Count: {count}, Damage/Metadata: {damage}, X:{x}, Y:{y}, Z:{z}, Yaw:{yaw}, Pitch:{pitch}, Roll:{roll}")
@@ -331,7 +356,6 @@ def handle_server(sock):
                 
                 unknown_flag = struct.unpack('>i', recv_exact(sock, 4))[0]
                 if unknown_flag > 0:
-                    # These three shorts are only sent if unknown_flag > 0
                     unknown_short1 = struct.unpack('>h', recv_exact(sock, 2))[0]
                     unknown_short2 = struct.unpack('>h', recv_exact(sock, 2))[0]
                     unknown_short3 = struct.unpack('>h', recv_exact(sock, 2))[0]
@@ -358,15 +382,9 @@ def handle_server(sock):
 
             elif pid == 0x1B:
                 # Stance update (?) (Server to Client)
-                # Documentation notes: "It doesn't seem to be used (see 0x0D)."
-                # But if it's sent, we must consume the bytes to maintain sync.
-                # Assuming the example fields: 4 floats, 2 booleans based on typical structure for position/look.
-                # The doc implies 4 floats and 2 booleans based on "???float ... ???boolean".
-                # If this causes issues, we might need to verify the exact number/types.
                 float1, float2, float3, float4 = struct.unpack('>ffff', recv_exact(sock, 16))
                 bool1, bool2 = struct.unpack('>?', recv_exact(sock, 1))[0], struct.unpack('>?', recv_exact(sock, 1))[0]
                 print(f"[StanceUpdate(0x1B)] Data: {float1}, {float2}, {float3}, {float4}, {bool1}, {bool2}")
-
 
             elif pid == 0x1C:
                 # Entity Velocity (Server to Client only)
@@ -439,7 +457,7 @@ def handle_server(sock):
             elif pid == 0x33:
                 # Map Chunk (Server to Client only)
                 x = struct.unpack('>i', recv_exact(sock, 4))[0]
-                y_coord = struct.unpack('>h', recv_exact(sock, 2))[0] # Y is a short here!
+                y_coord = struct.unpack('>h', recv_exact(sock, 2))[0]
                 z = struct.unpack('>i', recv_exact(sock, 4))[0]
                 size_x = struct.unpack('>b', recv_exact(sock, 1))[0]
                 size_y = struct.unpack('>b', recv_exact(sock, 1))[0]
@@ -447,9 +465,14 @@ def handle_server(sock):
                 compressed_size = struct.unpack('>i', recv_exact(sock, 4))[0]
                 compressed_data = recv_exact(sock, compressed_size)
                 
-                # You can decompress and process chunk data here if needed.
-                # decompressed_data = zlib.decompress(compressed_data)
-                # print(f"  Decompressed chunk data size: {len(decompressed_data)}")
+                # Decompress chunk data here if needed.
+                # try:
+                #     decompressed_data = zlib.decompress(compressed_data)
+                #     # print(f"  Decompressed chunk data size: {len(decompressed_data)}")
+                # except zlib.error as e:
+                #     print(f"[ERROR] Zlib decompression error for MapChunk: {e}")
+                #     # You might want to raise an error or just log this and continue,
+                #     # as the stream alignment is maintained even if decompression fails.
 
                 print(f"[MapChunk] X: {x}, Y_Coord: {y_coord}, Z: {z}, Size: ({size_x},{size_y},{size_z}), CompSize: {compressed_size}")
             
@@ -472,19 +495,11 @@ def handle_server(sock):
                     metadata_array.append(struct.unpack('>b', recv_exact(sock, 1))[0])
                 
                 print(f"[MultiBlockChange] ChunkX:{chunk_x}, ChunkZ:{chunk_z}, NumChanges:{array_size}")
-                # For detailed output, you could iterate and print each change:
-                # for i in range(array_size):
-                #     # Decode coordinate short: top 4 bits X, next 4 bits Z, bottom 8 bits Y
-                #     coord_short = coordinates[i]
-                #     x_offset = (coord_short >> 12) & 0xF
-                #     z_offset = (coord_short >> 8) & 0xF
-                #     y_offset = coord_short & 0xFF
-                #     print(f"  Change {i}: Coord ({x_offset}, {y_offset}, {z_offset}), Type:{block_types[i]}, Meta:{metadata_array[i]}")
 
             elif pid == 0x35:
                 # Block Change (Server to Client only)
                 x = struct.unpack('>i', recv_exact(sock, 4))[0]
-                y = struct.unpack('>b', recv_exact(sock, 1))[0] # Y is a byte here
+                y = struct.unpack('>b', recv_exact(sock, 1))[0]
                 z = struct.unpack('>i', recv_exact(sock, 4))[0]
                 block_type = struct.unpack('>b', recv_exact(sock, 1))[0]
                 block_metadata = struct.unpack('>b', recv_exact(sock, 1))[0]
@@ -493,10 +508,10 @@ def handle_server(sock):
             elif pid == 0x36:
                 # Block Action (Server to Client only) - For Note Blocks or Pistons
                 x = struct.unpack('>i', recv_exact(sock, 4))[0]
-                y = struct.unpack('>h', recv_exact(sock, 2))[0] # Y is short here
+                y = struct.unpack('>h', recv_exact(sock, 2))[0]
                 z = struct.unpack('>i', recv_exact(sock, 4))[0]
-                byte1 = struct.unpack('>b', recv_exact(sock, 1))[0] # Instrument Type / State
-                byte2 = struct.unpack('>b', recv_exact(sock, 1))[0] # Pitch / Direction
+                byte1 = struct.unpack('>b', recv_exact(sock, 1))[0]
+                byte2 = struct.unpack('>b', recv_exact(sock, 1))[0]
                 print(f"[BlockAction] X:{x}, Y:{y}, Z:{z}, Byte1:{byte1}, Byte2:{byte2}")
 
             elif pid == 0x47:
@@ -513,12 +528,12 @@ def handle_server(sock):
                 items = []
                 for _ in range(count):
                     item_id = struct.unpack('>h', recv_exact(sock, 2))[0]
-                    if item_id != -1: # -1 indicates an empty slot, no further data
+                    if item_id != -1:
                         item_count = struct.unpack('>b', recv_exact(sock, 1))[0]
                         item_damage = struct.unpack('>h', recv_exact(sock, 2))[0]
                         items.append({'id': item_id, 'count': item_count, 'damage': item_damage})
                     else:
-                        items.append({'id': -1, 'count': 0, 'damage': 0}) # Represent empty slot
+                        items.append({'id': -1, 'count': 0, 'damage': 0})
                 print(f"[WindowItems] Window ID: {window_id}, Count: {count}, Items: {items}")
 
             elif pid == 0xFF:
@@ -538,15 +553,20 @@ def handle_server(sock):
     except Exception as e:
         print(f"[General Error] {e}")
     finally:
-        print("[Packet Handler] Closing socket.")
-        sock.close()
+        # This block will execute when the `while True` loop breaks or an exception occurs.
+        # However, for a Ctrl+C, the signal handler takes over.
+        # This is primarily for other graceful exits or unexpected errors.
+        if sock and sock._closed == False: # Check if socket is still open
+            print("[Packet Handler] Closing socket from finally block.")
+            sock.close()
 
 # === Connection Logic ===
 def connect_to_server():
-    global bot_x, bot_y, bot_z, bot_stance, bot_yaw, bot_pitch, bot_on_ground, bot_entity_id
+    global bot_x, bot_y, bot_z, bot_stance, bot_yaw, bot_pitch, bot_on_ground, bot_entity_id, global_socket
 
     print(f"Connecting to {SERVER_HOST}:{SERVER_PORT}...")
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    global_socket = s # Assign the socket to the global variable
     try:
         s.connect((SERVER_HOST, SERVER_PORT))
         print("Connected.")
@@ -569,13 +589,9 @@ def connect_to_server():
         protocol_version = 14  # Beta 1.7.3 protocol version
         login_data = struct.pack('>i', protocol_version)
         login_data += encode_string_utf16(USERNAME)
-        # The connection hash from 0x02 Handshake is sent here for authentication purposes.
-        # If it was '-', client continues without name auth. If '+', client sends password.
-        # For simplicity and given your goal is botting, send the received hash.
-        # If the server hash was '-', send '-' back.
-        login_data += encode_string_utf16(connection_hash) # Send the hash received from 0x02
-        login_data += struct.pack('>q', 0)           # Map seed (ignored by server for client login)
-        login_data += struct.pack('>b', 0)           # Dimension (0 for overworld)
+        login_data += encode_string_utf16(connection_hash)
+        login_data += struct.pack('>q', 0)
+        login_data += struct.pack('>b', 0)
         send_packet(s, 0x01, login_data)
         print("[Login] Sent.")
 
@@ -588,42 +604,43 @@ def connect_to_server():
             map_seed = struct.unpack('>q', recv_exact(s, 8))[0]
             dimension = struct.unpack('>b', recv_exact(s, 1))[0]
             print(f"[Login Success (0x01)] Entity ID: {bot_entity_id}, Unknown String: '{unknown_string}', Map Seed: {map_seed}, Dimension: {dimension}")
+            
+            # Start a separate thread for handling incoming server packets
+            server_listener_thread = threading.Thread(target=handle_server, args=(s,))
+            server_listener_thread.daemon = True # Allow main program to exit even if thread is running
+            server_listener_thread.start()
+
+            # Main loop for client-side actions (e.g., sending movement, chat)
+            # This loop will now run concurrently with the handle_server thread
+            while True:
+                # Example: Send a Player Position Look packet every few seconds
+                # You might not need to send this constantly if the server sends 0x0D
+                # and your bot responds. But it's good for initial setup.
+                # If your bot is moving or looking around, update bot_x,y,z,yaw,pitch here
+                # before sending this.
+                
+                # For now, just a dummy loop to keep the main thread alive
+                # and allow the signal handler to work.
+                time.sleep(1) 
 
         elif pid == 0xFF:
             msg = read_string_utf16(s)
-            print(f"[Login Failed (0xFF)] {msg}")
-            s.close()
-            return
+            print(f"[Login Failed] Server kicked us: {msg}")
         else:
-            print(f"[Unexpected] Packet ID after login initial sequence: 0x{pid:02X}. Disconnecting.")
-            s.close()
-            return
-
-        # Start listening to server packets in a separate thread
-        threading.Thread(target=handle_server, args=(s,), daemon=True).start()
-
-        # Main thread sends movement packets to keep connection alive and simulate activity
-        print("[Main Thread] Bot is now running. Press Ctrl+C to exit.")
-        while True:
-            # Send Player Position & Look (0x0D) periodically
-            # This is a good way to keep the connection alive and update position.
-            # Even if the bot is "standing still", send updates regularly.
-            # The server might kick if it doesn't receive movement updates.
-            # For this simple bot, we'll just send the last known position.
-            
-            # Use 0x0D Client to Server structure: X, Y, Stance, Z, Yaw, Pitch, OnGround
-            movement_data = struct.pack('>ddddff?', bot_x, bot_y, bot_stance, bot_z, bot_yaw, bot_pitch, bot_on_ground)
-            send_packet(s, 0x0D, movement_data)
-
-            time.sleep(0.5) # Send every half second (2 ticks)
-
-    except KeyboardInterrupt:
-        print("\n[Exit] Closing connection.")
-    except Exception as e:
+            print(f"[Unexpected] Expected 0x01 Login Success or 0xFF Disconnect, got 0x{pid:02X}.")
+        
+    except ConnectionRefusedError:
+        print("[Error] Connection refused. Is the server running and accessible?")
+    except ConnectionError as e:
         print(f"[Connection Error] {e}")
+    except Exception as e:
+        print(f"[General Error during Connection/Login] {e}")
     finally:
-        s.close()
+        if s and not s._closed: # Check if socket is still open before trying to close
+            print("[INFO] Connection attempt finished. Closing socket.")
+            s.close()
+        global_socket = None # Clear global socket reference
 
-# === Entry Point ===
+
 if __name__ == "__main__":
     connect_to_server()
