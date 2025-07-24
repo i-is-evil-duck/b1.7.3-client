@@ -10,13 +10,13 @@ import sys    # Import sys for sys.exit()
 SERVER_HOST = "mc.evilduckz.net"
 SERVER_PORT = 25565
 USERNAME = "TestBot"
-
 # === Global State (for player position/look) ===
 bot_x, bot_y, bot_z = 0.0, 64.0, 0.0
 bot_stance = bot_y + 1.62
 bot_yaw, bot_pitch = 0.0, 0.0
 bot_on_ground = False
 bot_entity_id = -1
+bot_dimension = 0  # Add this line
 
 # === Global Socket Variable ===
 # Make the socket accessible globally or pass it to the signal handler
@@ -57,7 +57,32 @@ def send_packet(sock, packet_id, data=b''):
     full_packet = struct.pack('>B', packet_id) + data
     print(f"[Send] ID: 0x{packet_id:02X}, Length: {len(full_packet)} Bytes: {full_packet.hex()}")
     debug_send(sock, full_packet)
+def send_periodic_keep_alives(sock, interval=15):
+    global running_client
+    keep_alive_id_counter = 0
+    while running_client:
+        try:
+            send_packet(sock, 0x00, struct.pack('>i', keep_alive_id_counter))
+            print(f"[KeepAlive Sender] Sent 0x00 ID: {keep_alive_id_counter}") # Add this
+            keep_alive_id_counter += 1
+            time.sleep(interval)
+        except Exception as e:
+            print(f"[KeepAlive Sender Error] {e}")
+            running_client = False
+            break
 
+def send_periodic_player_updates(sock, interval=0.05):
+    global running_client, bot_x, bot_y, bot_stance, bot_z, bot_yaw, bot_pitch, bot_on_ground
+    while running_client:
+        try:
+            player_data = struct.pack('>ddddff?', bot_x, bot_y, bot_stance, bot_z, bot_yaw, bot_pitch, bot_on_ground)
+            send_packet(sock, 0x0D, player_data)
+            print(f"[Player Update Sender] Sent 0x0D Pos: ({bot_x:.1f}, {bot_y:.1f}, {bot_z:.1f})") # Add this
+            time.sleep(interval)
+        except Exception as e:
+            print(f"[Player Update Sender Error] {e}")
+            running_client = False
+            break
 def recv_exact(sock, length):
     """Receives an exact number of bytes from the socket."""
     data = b''
@@ -132,7 +157,12 @@ def read_metadata(sock):
 # === Packet Handling ===
 def handle_server(sock):
     global bot_x, bot_y, bot_z, bot_stance, bot_yaw, bot_pitch, bot_on_ground, bot_entity_id
-
+    # Reason code mapping based on your provided information
+    REASON_CODES_0x46 = {
+        0: "Invalid Bed (tile.bed.notValid)",
+        1: "Begin raining",
+        2: "End raining"
+    }
     try:
         while True:
             pid = recv_packet_id(sock)
@@ -150,20 +180,65 @@ def handle_server(sock):
                 amount = struct.unpack('>b', recv_exact(sock, 1))[0]
                 print(f"[IncrementStatistic] Stat ID: {stat_id}, Amount: {amount}")
 
+
+            # --- NEW/INVALID STATE PACKET (0x46) ---
+            elif pid == 0x46:
+                reason_code = struct.unpack('>b', recv_exact(sock, 1))[0]
+                reason_text = REASON_CODES_0x46.get(reason_code, f"Unknown Reason Code {reason_code}")
+                print(f"[New/Invalid State (0x46)] Reason Code: {reason_code} ({reason_text})")
+                # You might want to add specific logic here based on the reason code:
+                if reason_code == 0:
+                    # Handle invalid bed spawn point scenario
+                    print("  Action: Bed cannot be used as a spawn point.")
+                    pass
+                elif reason_code == 1:
+                    # Handle beginning of rain
+                    print("  Action: Rain has started.")
+                    pass
+                elif reason_code == 2:
+                    # Handle end of rain
+                    print("  Action: Rain has stopped.")
+                    pass
+                else:
+                    # Handle unknown future uses or unexpected codes
+                    print(f"  Warning: Unhandled 0x46 reason code. Further investigation may be needed.")
+
+            # --- Explosion (0x3C) ---
+            elif pid == 0x3C:
+                x = struct.unpack('>d', recv_exact(sock, 8))[0]
+                y = struct.unpack('>d', recv_exact(sock, 8))[0]
+                z = struct.unpack('>d', recv_exact(sock, 8))[0]
+                unknown_float = struct.unpack('>f', recv_exact(sock, 4))[0] # This is likely 'radius'
+                record_count = struct.unpack('>i', recv_exact(sock, 4))[0]
+
+                records = []
+                for _ in range(record_count):
+                    dx = struct.unpack('>b', recv_exact(sock, 1))[0]
+                    dy = struct.unpack('>b', recv_exact(sock, 1))[0]
+                    dz = struct.unpack('>b', recv_exact(sock, 1))[0]
+                    records.append((dx, dy, dz))
+                
+                print(f"[Explosion (0x3C)] X:{x:.2f}, Y:{y:.2f}, Z:{z:.2f}, Radius?: {unknown_float:.2f}, Affected Blocks Count: {record_count}, Records: {records}")
+
+
             elif pid == 0x3D:
-                # Spawn Mob (Server to Client only)
-                eid = struct.unpack('>i', recv_exact(sock, 4))[0]
-                mob_type = struct.unpack('>b', recv_exact(sock, 1))[0]
+                # Sound Effect (Server to Client)
+                effect_id = struct.unpack('>i', recv_exact(sock, 4))[0]
                 x = struct.unpack('>i', recv_exact(sock, 4))[0]
-                y = struct.unpack('>i', recv_exact(sock, 4))[0]
+                y = struct.unpack('>b', recv_exact(sock, 1))[0]
                 z = struct.unpack('>i', recv_exact(sock, 4))[0]
-                yaw = struct.unpack('>b', recv_exact(sock, 1))[0]
-                pitch = struct.unpack('>b', recv_exact(sock, 1))[0]
+                sound_data = struct.unpack('>i', recv_exact(sock, 4))[0]
                 
-                # Read mob-specific metadata
-                metadata = read_metadata(sock)
-                
-                print(f"[SpawnMob] EID: {eid}, Type: {mob_type}, X:{x}, Y:{y}, Z:{z}, Yaw:{yaw}, Pitch:{pitch}, Metadata: {metadata}")
+                print(f"[SoundEffect] Effect ID: {effect_id}, X:{x}, Y:{y}, Z:{z}, Data: {sound_data}")
+
+                # Optional: Add logic to interpret the effect ID
+                if effect_id == 2001:
+                    print(f"  -> Block (ID: {sound_data}) was broken near ({x}, {y}, {z})")
+
+            elif pid == 0x65:
+                # Close Window (Server to Client)
+                window_id = struct.unpack('>b', recv_exact(sock, 1))[0]
+                print(f"[CloseWindow] Window ID: {window_id}")
 
             elif pid == 0x67:
                 # Set Slot (Server to Client only)
@@ -430,11 +505,20 @@ def handle_server(sock):
                 yaw, pitch = struct.unpack('>bb', recv_exact(sock, 2))
                 print(f"[EntityTeleport] EID: {eid}, X:{x}, Y:{y}, Z:{z}, Yaw:{yaw}, Pitch:{pitch}")
 
+            
+
             elif pid == 0x26:
-                # Entity Status? (Server to Client only)
+                # Entity Status (Server to Client only)
                 eid = struct.unpack('>i', recv_exact(sock, 4))[0]
                 status_byte = struct.unpack('>b', recv_exact(sock, 1))[0]
                 print(f"[EntityStatus] EID: {eid}, Status: {status_byte}")
+
+                # --- RESPAWN LOGIC ---
+                # Status 2 = Hurt, Status 3 = Dead
+                if eid == bot_entity_id and status_byte == 3:
+                    print("[Death] Bot has died. Sending respawn packet...")
+                    # For Client-to-Server, the 0x09 packet is empty
+                    send_packet(sock, 0x09, b'')
 
             elif pid == 0x27:
                 # Attach Entity?
@@ -559,87 +643,83 @@ def handle_server(sock):
         if sock and sock._closed == False: # Check if socket is still open
             print("[Packet Handler] Closing socket from finally block.")
             sock.close()
+# === Add this new global variable at the top with the others ===
+running_client = False
 
-# === Connection Logic ===
+# ... (keep all your other code the same) ...
+
+# === Replace your existing connect_to_server function with this one ===
 def connect_to_server():
-    global bot_x, bot_y, bot_z, bot_stance, bot_yaw, bot_pitch, bot_on_ground, bot_entity_id, global_socket
+    global bot_x, bot_y, bot_z, bot_stance, bot_yaw, bot_pitch, bot_on_ground, bot_entity_id, global_socket, running_client
+    global bot_x, bot_y, bot_z, bot_stance, bot_yaw, bot_pitch, bot_on_ground, bot_entity_id, global_socket, running_client, bot_dimension
 
     print(f"Connecting to {SERVER_HOST}:{SERVER_PORT}...")
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    global_socket = s # Assign the socket to the global variable
+    global_socket = s
     try:
         s.connect((SERVER_HOST, SERVER_PORT))
         print("Connected.")
+        running_client = True # <<< Set the running state to True
 
         # Handshake (0x02) - Client to Server
         send_packet(s, 0x02, encode_string_utf16(USERNAME))
-        print("[Handshake] Sent.")
 
         # Read server's handshake response (0x02)
         pid = recv_packet_id(s)
-        if pid == 0x02:
-            connection_hash = read_string_utf16(s)
-            print(f"[Handshake Response (0x02)] Server Connection Hash: '{connection_hash}'")
-        else:
-            print(f"[Unexpected] Expected 0x02 Handshake Response, got 0x{pid:02X}. Disconnecting.")
+        if pid != 0x02:
+            print(f"[Unexpected] Expected 0x02 Handshake Response, got 0x{pid:02X}.")
             s.close()
             return
+        connection_hash = read_string_utf16(s)
+        print(f"[Handshake Response] Server Connection Hash: '{connection_hash}'")
 
         # Login Request (0x01) - Client to Server
-        protocol_version = 14  # Beta 1.7.3 protocol version
-        login_data = struct.pack('>i', protocol_version)
-        login_data += encode_string_utf16(USERNAME)
-        login_data += encode_string_utf16(connection_hash)
-        login_data += struct.pack('>q', 0)
-        login_data += struct.pack('>b', 0)
+        protocol_version = 14
+        login_data = struct.pack('>i', protocol_version) + encode_string_utf16(USERNAME) + encode_string_utf16(connection_hash) + struct.pack('>q', 0) + struct.pack('>b', 0)
         send_packet(s, 0x01, login_data)
-        print("[Login] Sent.")
 
         # Server Response after login
         pid = recv_packet_id(s)
         if pid == 0x01:
-            # Login Success (0x01) - Server to Client
+            # Login Success
             bot_entity_id = struct.unpack('>i', recv_exact(s, 4))[0]
             unknown_string = read_string_utf16(s)
             map_seed = struct.unpack('>q', recv_exact(s, 8))[0]
             dimension = struct.unpack('>b', recv_exact(s, 1))[0]
-            print(f"[Login Success (0x01)] Entity ID: {bot_entity_id}, Unknown String: '{unknown_string}', Map Seed: {map_seed}, Dimension: {dimension}")
+            print(f"[Login Success] EID: {bot_entity_id}, Seed: {map_seed}, Dim: {dimension}")
             
-            # Start a separate thread for handling incoming server packets
+            # Start thread for handling incoming packets
             server_listener_thread = threading.Thread(target=handle_server, args=(s,))
-            server_listener_thread.daemon = True # Allow main program to exit even if thread is running
+            server_listener_thread.daemon = True
             server_listener_thread.start()
 
-            # Main loop for client-side actions (e.g., sending movement, chat)
-            # This loop will now run concurrently with the handle_server thread
-            while True:
-                # Example: Send a Player Position Look packet every few seconds
-                # You might not need to send this constantly if the server sends 0x0D
-                # and your bot responds. But it's good for initial setup.
-                # If your bot is moving or looking around, update bot_x,y,z,yaw,pitch here
-                # before sending this.
-                
-                # For now, just a dummy loop to keep the main thread alive
-                # and allow the signal handler to work.
+            # --- START THE PERIODIC UPDATE THREAD (THIS IS THE FIX) ---
+            player_update_thread = threading.Thread(target=send_periodic_player_updates, args=(s,))
+            player_update_thread.daemon = True
+            player_update_thread.start()
+            
+            # Keep the main thread alive while the other threads run
+            while running_client and server_listener_thread.is_alive():
                 time.sleep(1) 
 
         elif pid == 0xFF:
             msg = read_string_utf16(s)
-            print(f"[Login Failed] Server kicked us: {msg}")
+            print(f"[Login Failed] Kicked: {msg}")
         else:
-            print(f"[Unexpected] Expected 0x01 Login Success or 0xFF Disconnect, got 0x{pid:02X}.")
-        
+            print(f"[Unexpected] Expected 0x01 Login or 0xFF Kick, got 0x{pid:02X}.")
+    
     except ConnectionRefusedError:
-        print("[Error] Connection refused. Is the server running and accessible?")
+        print("[Error] Connection refused.")
     except ConnectionError as e:
         print(f"[Connection Error] {e}")
     except Exception as e:
-        print(f"[General Error during Connection/Login] {e}")
+        print(f"[General Error] {e}")
     finally:
-        if s and not s._closed: # Check if socket is still open before trying to close
-            print("[INFO] Connection attempt finished. Closing socket.")
+        running_client = False # <<< Signal threads to stop
+        if s and not s._closed:
+            print("[INFO] Closing socket.")
             s.close()
-        global_socket = None # Clear global socket reference
+        global_socket = None
 
 
 if __name__ == "__main__":
