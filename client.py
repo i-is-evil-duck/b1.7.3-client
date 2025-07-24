@@ -87,13 +87,16 @@ def read_metadata(sock):
             item_count = struct.unpack('>b', recv_exact(sock, 1))[0]
             item_damage = struct.unpack('>h', recv_exact(sock, 2))[0]
             value = {'id': item_id, 'count': item_count, 'damage': item_damage}
-        elif data_type == 6: # extra entity information (int x, int y, int z)
+        elif data_type == 6: # vector (int x, int y, int z)
             x, y, z = struct.unpack('>iii', recv_exact(sock, 12))
             value = {'x': x, 'y': y, 'z': z}
+        elif data_type == 7: # UNKNOWN TYPE - Trying 8 bytes (like a long)
+            # This is a better guess for an unknown simple type that's larger than an int.
+            unknown_bytes = recv_exact(sock, 8) # Consume 8 bytes
+            value = f"UnknownType7({unknown_bytes.hex()})"
+            print(f"[WARN] Handling unknown metadata type 7 (index {index}). Consumed 8 bytes: {value}")
         else:
-            print(f"[WARN] Unknown metadata type {data_type} for index {index}. Skipping unknown bytes (may cause desync).")
-            # For unhandled types, you'd need to guess how many bytes to skip.
-            # This is dangerous. Raise an error to force an update.
+            print(f"[ERROR] Unhandled metadata type: {data_type} for index {index}. This is a critical error.")
             raise RuntimeError(f"Unhandled metadata type: {data_type} for metadata field 0x{x:02X}")
         
         metadata[index] = {'type': data_type, 'value': value}
@@ -113,6 +116,13 @@ def handle_server(sock):
                 keep_alive_id = struct.unpack('>i', recv_exact(sock, 4))[0]
                 print(f"[KeepAlive] ID: {keep_alive_id}")
                 send_packet(sock, 0x00, struct.pack('>i', keep_alive_id))
+
+            elif pid == 0xC8:
+                # Increment Statistic (Server to Client only)
+                stat_id = struct.unpack('>i', recv_exact(sock, 4))[0]
+                amount = struct.unpack('>b', recv_exact(sock, 1))[0]
+                print(f"[IncrementStatistic] Stat ID: {stat_id}, Amount: {amount}")
+
 
             elif pid == 0x67:
                 # Set Slot (Server to Client only)
