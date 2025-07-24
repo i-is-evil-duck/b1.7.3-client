@@ -200,7 +200,6 @@ def handle_server(sock):
                     print("  Action: Rain has stopped.")
                     pass
                 else:
-                    # Handle unknown future uses or unexpected codes
                     print(f"  Warning: Unhandled 0x46 reason code. Further investigation may be needed.")
 
             # --- Explosion (0x3C) ---
@@ -308,6 +307,10 @@ def handle_server(sock):
                 # Update Health (Server to Client only)
                 health = struct.unpack('>h', recv_exact(sock, 2))[0]
                 print(f"[UpdateHealth] Health: {health}")
+                # --- ADDED LOGIC FOR AUTO-RESPAWN ---
+                if health <= 0:
+                    print("[Death] Health is 0 or less. Sending respawn packet...")
+                    send_packet(sock, 0x09, b'') # 0x09 Respawn packet has no payload from client
 
             elif pid == 0x09:
                 # Respawn (Server to Client)
@@ -513,12 +516,13 @@ def handle_server(sock):
                 status_byte = struct.unpack('>b', recv_exact(sock, 1))[0]
                 print(f"[EntityStatus] EID: {eid}, Status: {status_byte}")
 
-                # --- RESPAWN LOGIC ---
+                # --- RESPAWN LOGIC (FROM YOUR ORIGINAL CODE, BUT 0x08 IS BETTER) ---
                 # Status 2 = Hurt, Status 3 = Dead
-                if eid == bot_entity_id and status_byte == 3:
-                    print("[Death] Bot has died. Sending respawn packet...")
-                    # For Client-to-Server, the 0x09 packet is empty
-                    send_packet(sock, 0x09, b'')
+                # While this is a valid place for respawn logic, relying on 0x08
+                # for health updates is generally more direct for player death.
+                # if eid == bot_entity_id and status_byte == 3:
+                #     print("[Death] Bot has died. Sending respawn packet...")
+                #     send_packet(sock, 0x09, b'')
 
             elif pid == 0x27:
                 # Attach Entity?
