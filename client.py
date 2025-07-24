@@ -87,16 +87,13 @@ def read_metadata(sock):
             item_count = struct.unpack('>b', recv_exact(sock, 1))[0]
             item_damage = struct.unpack('>h', recv_exact(sock, 2))[0]
             value = {'id': item_id, 'count': item_count, 'damage': item_damage}
-        elif data_type == 6: # vector (int x, int y, int z)
+        elif data_type == 6: # extra entity information (int x, int y, int z)
             x, y, z = struct.unpack('>iii', recv_exact(sock, 12))
             value = {'x': x, 'y': y, 'z': z}
-        elif data_type == 7: # UNKNOWN TYPE - Trying 8 bytes (like a long)
-            # This is a better guess for an unknown simple type that's larger than an int.
-            unknown_bytes = recv_exact(sock, 8) # Consume 8 bytes
-            value = f"UnknownType7({unknown_bytes.hex()})"
-            print(f"[WARN] Handling unknown metadata type 7 (index {index}). Consumed 8 bytes: {value}")
         else:
-            print(f"[ERROR] Unhandled metadata type: {data_type} for index {index}. This is a critical error.")
+            print(f"[WARN] Unknown metadata type {data_type} for index {index}. Skipping unknown bytes (may cause desync).")
+            # For unhandled types, you'd need to guess how many bytes to skip.
+            # This is dangerous. Raise an error to force an update.
             raise RuntimeError(f"Unhandled metadata type: {data_type} for metadata field 0x{x:02X}")
         
         metadata[index] = {'type': data_type, 'value': value}
@@ -123,6 +120,20 @@ def handle_server(sock):
                 amount = struct.unpack('>b', recv_exact(sock, 1))[0]
                 print(f"[IncrementStatistic] Stat ID: {stat_id}, Amount: {amount}")
 
+            elif pid == 0x3D:
+                # Spawn Mob (Server to Client only)
+                eid = struct.unpack('>i', recv_exact(sock, 4))[0]
+                mob_type = struct.unpack('>b', recv_exact(sock, 1))[0]
+                x = struct.unpack('>i', recv_exact(sock, 4))[0]
+                y = struct.unpack('>i', recv_exact(sock, 4))[0]
+                z = struct.unpack('>i', recv_exact(sock, 4))[0]
+                yaw = struct.unpack('>b', recv_exact(sock, 1))[0]
+                pitch = struct.unpack('>b', recv_exact(sock, 1))[0]
+                
+                # Read mob-specific metadata
+                metadata = read_metadata(sock)
+                
+                print(f"[SpawnMob] EID: {eid}, Type: {mob_type}, X:{x}, Y:{y}, Z:{z}, Yaw:{yaw}, Pitch:{pitch}, Metadata: {metadata}")
 
             elif pid == 0x67:
                 # Set Slot (Server to Client only)
@@ -293,8 +304,8 @@ def handle_server(sock):
                 x, y, z = struct.unpack('>iii', recv_exact(sock, 12))
                 yaw, pitch = struct.unpack('>bb', recv_exact(sock, 2))
                 current_item = struct.unpack('>h', recv_exact(sock, 2))[0]
-                metadata = read_metadata(sock)
-                print(f"[SpawnNamedEntity] EID: {eid}, Name: '{player_name}', X:{x}, Y:{y}, Z:{z}, Yaw:{yaw}, Pitch:{pitch}, Item:{current_item}, Metadata: {metadata}")
+                # metadata = read_metadata(sock) # REMOVE THIS LINE!
+                print(f"[SpawnNamedEntity] EID: {eid}, Name: '{player_name}', X:{x}, Y:{y}, Z:{z}, Yaw:{yaw}, Pitch:{pitch}, Item:{current_item}")
 
             elif pid == 0x15:
                 # Pickup Spawn (Server to Client only)
