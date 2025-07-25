@@ -5,12 +5,15 @@ import time
 import zlib
 import signal
 import sys
+import tkinter as tk # Import tkinter
 
 # === Configuration ===
 SERVER_HOST = "mc.evilduckz.net"
 SERVER_PORT = 25565
 USERNAME = "TestBot"
 RECONNECT_DELAY_SECONDS = 5 # How long to wait before attempting to reconnect
+MOVE_DISTANCE = 1.0 # Distance to move per key press
+MIN_Y = 0.0 # Define a minimum Y coordinate to prevent falling into void/illegal stance issues
 
 # === Global State (for player position/look) ===
 bot_x, bot_y, bot_z = 0.0, 64.0, 0.0
@@ -23,6 +26,12 @@ bot_dimension = 0
 # === Global Socket Variable ===
 global_socket = None
 running_client = False # Control flag for threads
+
+# === Movement Queue ===
+# Use a thread-safe queue for movement commands if you were to have complex interactions
+# For simple key presses, direct modification with a lock is fine, but a queue is good practice
+movement_queue = []
+movement_lock = threading.Lock()
 
 # === Signal Handler for graceful shutdown ===
 def signal_handler(sig, frame):
@@ -84,9 +93,11 @@ def send_periodic_player_updates(sock, interval=0.05):
             if sock._closed: # Check if socket is closed before sending
                 print("[Player Update Sender] Socket is closed. Exiting thread.")
                 break
-            player_data = struct.pack('>ddddff?', bot_x, bot_y, bot_stance, bot_z, bot_yaw, bot_pitch, bot_on_ground)
-            send_packet(sock, 0x0D, player_data)
-            print(f"[Player Update Sender] Sent 0x0D Pos: ({bot_x:.1f}, {bot_y:.1f}, {bot_z:.1f})")
+            # Use 0x0B for position updates
+            with movement_lock: # Ensure thread-safe access to bot coordinates
+                player_data = struct.pack('>dddd?', bot_x, bot_y, bot_stance, bot_z, bot_on_ground)
+            send_packet(sock, 0x0B, player_data) # Send Player Position (0x0B)
+            print(f"[Player Update Sender] Sent 0x0B Pos: ({bot_x:.1f}, {bot_y:.1f}, {bot_z:.1f})")
             time.sleep(interval)
         except Exception as e:
             if running_client: # Only log as error if client is still supposed to be running
@@ -248,9 +259,10 @@ def handle_server(sock):
             elif pid == 0x06: # Spawn Position
                 x, y, z = struct.unpack('>iii', recv_exact(sock, 12))
                 print(f"[SpawnPosition] X: {x}, Y: {y}, Z: {z}")
-                bot_x, bot_y, bot_z = float(x), float(y), float(z)
-                bot_stance = bot_y + 1.62
-                bot_on_ground = True
+                with movement_lock: # Protect shared variables
+                    bot_x, bot_y, bot_z = float(x), float(y), float(z)
+                    bot_stance = bot_y + 1.62
+                    bot_on_ground = True
 
             elif pid == 0x07: # Use Entity (Client to Server only - if received, it's unexpected)
                 recv_exact(sock, 9) # eid, target_eid, left_click
@@ -267,15 +279,15 @@ def handle_server(sock):
                 world = struct.unpack('>b', recv_exact(sock, 1))[0]
                 print(f"[Respawn] World: {world}")
 
-            elif pid == 0x0A: # Player (Client to Server)
+            elif pid == 0x0A: # Player (Client to Server) - Received unexpectedly
                 recv_exact(sock, 1) # on_ground
                 print(f"[WARN] Received unexpected 0x0A Player (Client-to-Server).")
 
-            elif pid == 0x0B: # Player Position (Client to Server)
+            elif pid == 0x0B: # Player Position (Client to Server) - Received unexpectedly
                 recv_exact(sock, 33) # x, y, stance, z, on_ground
                 print(f"[WARN] Received unexpected 0x0B Player Position (Client-to-Server).")
             
-            elif pid == 0x0C: # Player Look (Client to Server)
+            elif pid == 0x0C: # Player Look (Client to Server) - Received unexpectedly
                 recv_exact(sock, 9) # yaw, pitch, on_ground
                 print(f"[WARN] Received unexpected 0x0C Player Look (Client-to-Server).")
 
@@ -285,19 +297,21 @@ def handle_server(sock):
                 on_ground = struct.unpack('>?', recv_exact(sock, 1))[0]
                 print(f"[PositionLook] X: {x:.2f}, Y: {y:.2f}, Z: {z:.2f}, Stance: {stance:.2f}, Yaw: {yaw:.2f}, Pitch: {pitch:.2f}, OnGround: {on_ground}")
                 
-                bot_x, bot_y, bot_z = x, y, z
-                bot_stance = stance
-                bot_yaw, bot_pitch = yaw, pitch
-                bot_on_ground = on_ground
+                with movement_lock: # Protect shared variables
+                    bot_x, bot_y, bot_z = x, y, z
+                    bot_stance = stance
+                    bot_yaw, bot_pitch = yaw, pitch
+                    bot_on_ground = on_ground
 
+                # Client should acknowledge by sending back its current position/look
                 response_data = struct.pack('>ddddff?', bot_x, bot_y, bot_stance, bot_z, bot_yaw, bot_pitch, bot_on_ground)
                 send_packet(sock, 0x0D, response_data)
 
-            elif pid == 0x0E: # Player Digging (Client to Server)
+            elif pid == 0x0E: # Player Digging (Client to Server) - Received unexpectedly
                 recv_exact(sock, 10) # status, x, y, z, face
                 print(f"[WARN] Received unexpected 0x0E Player Digging (Client-to-Server).")
 
-            elif pid == 0x0F: # Player Block Placement (Client to Server)
+            elif pid == 0x0F: # Player Block Placement (Client to Server) - Received unexpectedly
                 x = struct.unpack('>i', recv_exact(sock, 4))[0]
                 y = struct.unpack('>b', recv_exact(sock, 1))[0]
                 z = struct.unpack('>i', recv_exact(sock, 4))[0]
@@ -307,7 +321,7 @@ def handle_server(sock):
                     recv_exact(sock, 3) # amount, damage
                 print(f"[WARN] Received unexpected 0x0F Player Block Placement (Client-to-Server).")
 
-            elif pid == 0x10: # Holding Change (Client to Server)
+            elif pid == 0x10: # Holding Change (Client to Server) - Received unexpectedly
                 recv_exact(sock, 2) # slot_id
                 print(f"[WARN] Received unexpected 0x10 Holding Change (Client-to-Server).")
 
@@ -322,7 +336,7 @@ def handle_server(sock):
                 animate_type = struct.unpack('>b', recv_exact(sock, 1))[0]
                 print(f"[Animation] EID: {eid}, Type: {animate_type}")
 
-            elif pid == 0x13: # Entity Action (Client to Server)
+            elif pid == 0x13: # Entity Action (Client to Server) - Received unexpectedly
                 recv_exact(sock, 5) # eid, action_type
                 print(f"[WARN] Received unexpected 0x13 Entity Action (Client-to-Server).")
 
@@ -586,6 +600,63 @@ def connect_and_manage_bot():
             print(f"Waiting {RECONNECT_DELAY_SECONDS} seconds before reconnecting...")
             time.sleep(RECONNECT_DELAY_SECONDS)
 
+# === Tkinter GUI for Key Input ===
+def on_key_press(event):
+    global bot_x, bot_y, bot_z, bot_stance # Add bot_stance to global
+    with movement_lock: # Protect shared variables during modification
+        if event.keysym == 'w':
+            bot_z += MOVE_DISTANCE
+            print(f"Moving bot North to ({bot_x}, {bot_z})")
+        elif event.keysym == 's':
+            bot_z -= MOVE_DISTANCE
+            print(f"Moving bot South to ({bot_x}, {bot_z})")
+        elif event.keysym == 'a':
+            bot_x += MOVE_DISTANCE # Inverted 'a' (moves right/East)
+            print(f"Moving bot East to ({bot_x}, {bot_z})")
+        elif event.keysym == 'd':
+            bot_x -= MOVE_DISTANCE # Inverted 'd' (moves left/West)
+            print(f"Moving bot West to ({bot_x}, {bot_z})")
+        elif event.keysym == 'space': # Move up
+            bot_y += MOVE_DISTANCE
+            bot_stance = bot_y + 1.62 # Update stance when Y changes
+            print(f"Moving bot Up to Y:{bot_y})")
+        elif event.keysym == 'Shift_L' or event.keysym == 'Shift_R': # Move down
+            # Prevent going below MIN_Y
+            new_y = bot_y - MOVE_DISTANCE
+            if new_y >= MIN_Y:
+                bot_y = new_y
+                bot_stance = bot_y + 1.62 # Update stance when Y changes
+                print(f"Moving bot Down to Y:{bot_y})")
+            else:
+                print(f"Cannot move below MIN_Y ({MIN_Y}). Current Y: {bot_y}")
+
+def start_gui():
+    root = tk.Tk()
+    root.title("Minecraft Bot Controller")
+    root.geometry("300x100")
+
+    label = tk.Label(root, text="Press WASD, Space (Up), Shift (Down) to move the bot.")
+    label.pack(pady=20)
+
+    # Bind key press events to the window
+    root.bind('<w>', on_key_press)
+    root.bind('<s>', on_key_press)
+    root.bind('<a>', on_key_press)
+    root.bind('<d>', on_key_press)
+    root.bind('<space>', on_key_press) # Bind space key
+    root.bind('<Shift_L>', on_key_press) # Bind left shift key
+    root.bind('<Shift_R>', on_key_press) # Bind right shift key
+
+    # Optional: Focus the window to ensure key presses are captured immediately
+    root.focus_force()
+
+    root.mainloop()
 
 if __name__ == "__main__":
-    connect_and_manage_bot()
+    # Start the bot connection and management in a separate thread
+    bot_thread = threading.Thread(target=connect_and_manage_bot)
+    bot_thread.daemon = True # Allow the bot thread to close when main thread exits
+    bot_thread.start()
+
+    # Start the GUI in the main thread
+    start_gui()
