@@ -33,6 +33,7 @@ running_client = False # Control flag for threads
 movement_queue = []
 movement_lock = threading.Lock()
 chat_queue = queue.Queue() # Queue for passing chat messages from network thread to GUI thread
+info_queue = queue.Queue() # New: Queue for passing info updates to GUI thread
 
 
 # === Signal Handler for graceful shutdown ===
@@ -107,6 +108,8 @@ def send_periodic_player_updates(sock, interval=0.05):
             # Use 0x0B for position updates
             with movement_lock: # Ensure thread-safe access to bot coordinates
                 player_data = struct.pack('>dddd?', bot_x, bot_y, bot_stance, bot_z, bot_on_ground)
+                # Update info queue with current position and look
+                info_queue.put(f"Pos: ({bot_x:.1f}, {bot_y:.1f}, {bot_z:.1f}) Yaw: {bot_yaw:.1f} Pitch: {bot_pitch:.1f}")
             send_packet(sock, 0x0B, player_data) # Send Player Position (0x0B)
             # print(f"[Player Update Sender] Sent 0x0B Pos: ({bot_x:.1f}, {bot_y:.1f}, {bot_z:.1f})") # Reduced spam
             time.sleep(interval)
@@ -277,6 +280,8 @@ def handle_server(sock):
                     bot_x, bot_y, bot_z = float(x), float(y), float(z)
                     bot_stance = bot_y + 1.62
                     bot_on_ground = True
+                info_queue.put(f"Spawned at: ({bot_x:.1f}, {bot_y:.1f}, {bot_z:.1f})")
+
 
             elif pid == 0x07: # Use Entity (Client to Server only - if received, it's unexpected)
                 recv_exact(sock, 9) # eid, target_eid, left_click
@@ -316,6 +321,7 @@ def handle_server(sock):
                     bot_stance = stance
                     bot_yaw, bot_pitch = yaw, pitch
                     bot_on_ground = on_ground
+                info_queue.put(f"Pos: ({bot_x:.1f}, {bot_y:.1f}, {bot_z:.1f}) Yaw: {bot_yaw:.1f} Pitch: {bot_pitch:.1f}")
 
                 # Client should acknowledge by sending back its current position/look
                 response_data = struct.pack('>ddddff?', bot_x, bot_y, bot_stance, bot_z, bot_yaw, bot_pitch, bot_on_ground)
@@ -628,9 +634,18 @@ class ChatClientGUI(tk.Frame):
         self.pack(fill="both", expand=True)
         self._create_widgets()
         self._bind_events()
-        self.master.after(100, self._process_chat_queue) # Start checking the queue
+        self.master.after(100, self._process_chat_queue) # Start checking the chat queue
+        self.master.after(100, self._process_info_queue) # New: Start checking the info queue
 
     def _create_widgets(self):
+        # Frame for info display
+        info_frame = tk.Frame(self, borderwidth=2, relief="groove")
+        info_frame.pack(side="top", fill="x", expand=False, padx=5, pady=5)
+
+        self.pos_yaw_pitch_label = tk.Label(info_frame, text="Pos: (X.X, Y.Y, Z.Z) Yaw: X.X Pitch: X.X", anchor="w")
+        self.pos_yaw_pitch_label.pack(side="top", fill="x", padx=5, pady=2)
+
+
         # Frame for chat display and input
         chat_frame = tk.Frame(self, borderwidth=2, relief="groove")
         chat_frame.pack(side="top", fill="both", expand=True, padx=5, pady=5)
@@ -671,16 +686,17 @@ class ChatClientGUI(tk.Frame):
         if self.master.focus_get() is self.chat_entry:
             return
 
-        global bot_x, bot_y, bot_z, bot_stance
+        global bot_x, bot_y, bot_z, bot_stance, bot_yaw, bot_pitch
         with movement_lock:
+            # Simple movement for demonstration, not accounting for yaw/pitch
             if event.keysym == 'w':
                 bot_z += MOVE_DISTANCE
             elif event.keysym == 's':
                 bot_z -= MOVE_DISTANCE
             elif event.keysym == 'a':
-                bot_x += MOVE_DISTANCE # Inverted 'a'
+                bot_x += MOVE_DISTANCE # Inverted 'a' based on your current code
             elif event.keysym == 'd':
-                bot_x -= MOVE_DISTANCE # Inverted 'd'
+                bot_x -= MOVE_DISTANCE # Inverted 'd' based on your current code
             elif event.keysym == 'space':
                 bot_y += MOVE_DISTANCE
                 bot_stance = bot_y + 1.62
@@ -692,6 +708,9 @@ class ChatClientGUI(tk.Frame):
                 else:
                     print(f"Cannot move below MIN_Y ({MIN_Y}).")
         print(f"Bot moved. New position: (X: {bot_x:.1f}, Y: {bot_y:.1f}, Z: {bot_z:.1f})")
+        # Update the info label immediately on movement
+        self.pos_yaw_pitch_label.config(text=f"Pos: ({bot_x:.1f}, {bot_y:.1f}, {bot_z:.1f}) Yaw: {bot_yaw:.1f} Pitch: {bot_pitch:.1f}")
+
 
     def _send_chat_message(self, event=None):
         message = self.chat_entry.get()
@@ -711,13 +730,23 @@ class ChatClientGUI(tk.Frame):
         self.chat_log.see(tk.END) # Scroll to the bottom
 
     def _process_chat_queue(self):
-        """Checks the queue for new messages and displays them."""
+        """Checks the chat queue for new messages and displays them."""
         try:
             while not chat_queue.empty():
                 message = chat_queue.get_nowait()
                 self._display_message(message)
         finally:
-            self.master.after(100, self._process_chat_queue) # Schedule the next check
+            self.master.after(100, self._process_chat_queue) # Schedule the next chat check
+
+    def _process_info_queue(self):
+        """Checks the info queue for new updates and displays them in the info label."""
+        try:
+            while not info_queue.empty():
+                info_message = info_queue.get_nowait()
+                self.pos_yaw_pitch_label.config(text=info_message)
+        finally:
+            self.master.after(100, self._process_info_queue) # Schedule the next info check
+
 
 def start_gui():
     root = tk.Tk()
