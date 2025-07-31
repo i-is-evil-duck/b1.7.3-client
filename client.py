@@ -5,12 +5,14 @@ import time
 import zlib
 import signal
 import sys
-import tkinter as tk # Import tkinter
+import tkinter as tk
+from tkinter import scrolledtext, simpledialog
+import queue # Import queue for thread-safe message passing
 
 # === Configuration ===
 SERVER_HOST = "mc.evilduckz.net"
 SERVER_PORT = 25565
-USERNAME = "TestBot"
+USERNAME = "Boy_Kisser_OwO"
 RECONNECT_DELAY_SECONDS = 5 # How long to wait before attempting to reconnect
 MOVE_DISTANCE = 1.0 # Distance to move per key press
 MIN_Y = 0.0 # Define a minimum Y coordinate to prevent falling into void/illegal stance issues
@@ -27,11 +29,11 @@ bot_dimension = 0
 global_socket = None
 running_client = False # Control flag for threads
 
-# === Movement Queue ===
-# Use a thread-safe queue for movement commands if you were to have complex interactions
-# For simple key presses, direct modification with a lock is fine, but a queue is good practice
+# === Thread-safe Queues ===
 movement_queue = []
 movement_lock = threading.Lock()
+chat_queue = queue.Queue() # Queue for passing chat messages from network thread to GUI thread
+
 
 # === Signal Handler for graceful shutdown ===
 def signal_handler(sig, frame):
@@ -64,9 +66,18 @@ def debug_send(sock, data):
 
 def send_packet(sock, packet_id, data=b''):
     """Constructs and sends a Minecraft packet."""
-    full_packet = struct.pack('>B', packet_id) + data
-    print(f"[Send] ID: 0x{packet_id:02X}, Length: {len(full_packet)} Bytes: {full_packet.hex()}")
-    debug_send(sock, full_packet)
+    if sock and not sock._closed:
+        try:
+            full_packet = struct.pack('>B', packet_id) + data
+            print(f"[Send] ID: 0x{packet_id:02X}, Length: {len(full_packet)} Bytes: {full_packet.hex()}")
+            debug_send(sock, full_packet)
+        except Exception as e:
+            print(f"[ERROR] Failed to send packet: {e}")
+            global running_client
+            running_client = False # Stop client on send error
+    else:
+        print("[WARN] Attempted to send packet on a closed or invalid socket.")
+
 
 def send_periodic_keep_alives(sock, interval=15):
     global running_client
@@ -77,7 +88,7 @@ def send_periodic_keep_alives(sock, interval=15):
                 print("[KeepAlive Sender] Socket is closed. Exiting thread.")
                 break
             send_packet(sock, 0x00, struct.pack('>i', keep_alive_id_counter))
-            print(f"[KeepAlive Sender] Sent 0x00 ID: {keep_alive_id_counter}")
+            # print(f"[KeepAlive Sender] Sent 0x00 ID: {keep_alive_id_counter}") # Reduced spam
             keep_alive_id_counter += 1
             time.sleep(interval)
         except Exception as e:
@@ -97,7 +108,7 @@ def send_periodic_player_updates(sock, interval=0.05):
             with movement_lock: # Ensure thread-safe access to bot coordinates
                 player_data = struct.pack('>dddd?', bot_x, bot_y, bot_stance, bot_z, bot_on_ground)
             send_packet(sock, 0x0B, player_data) # Send Player Position (0x0B)
-            print(f"[Player Update Sender] Sent 0x0B Pos: ({bot_x:.1f}, {bot_y:.1f}, {bot_z:.1f})")
+            # print(f"[Player Update Sender] Sent 0x0B Pos: ({bot_x:.1f}, {bot_y:.1f}, {bot_z:.1f})") # Reduced spam
             time.sleep(interval)
         except Exception as e:
             if running_client: # Only log as error if client is still supposed to be running
@@ -195,6 +206,12 @@ def handle_server(sock):
                 keep_alive_id = struct.unpack('>i', recv_exact(sock, 4))[0]
                 print(f"[KeepAlive] ID: {keep_alive_id}")
                 send_packet(sock, 0x00, struct.pack('>i', keep_alive_id))
+            
+            # --- CHAT PACKET (SERVER -> CLIENT) ---
+            elif pid == 0x03: # Chat message
+                msg = read_string_utf16(sock)
+                print(f"[Chat] {msg}")
+                chat_queue.put(msg) # Put the message in the queue for the GUI
 
             elif pid == 0xC8: # Increment Statistic
                 stat_id = struct.unpack('>i', recv_exact(sock, 4))[0]
@@ -238,18 +255,15 @@ def handle_server(sock):
                 map_seed = struct.unpack('>q', recv_exact(sock, 8))[0]
                 dimension = struct.unpack('>b', recv_exact(sock, 1))[0]
                 print(f"[Login Success (0x01)] Entity ID: {bot_entity_id}, Unknown String: '{unknown_string}', Map Seed: {map_seed}, Dimension: {dimension}")
+                chat_queue.put(f"--- Logged in successfully as {USERNAME} ---")
 
             elif pid == 0x02: # Handshake Response (Server to Client)
                 connection_hash = read_string_utf16(sock)
                 print(f"[Handshake Echo from Server (0x02)] Connection Hash: '{connection_hash}'")
 
-            elif pid == 0x03: # Chat message
-                msg = read_string_utf16(sock)
-                print(f"[Chat] {msg}")
-
             elif pid == 0x04: # Time Update
                 world_time = struct.unpack('>q', recv_exact(sock, 8))[0]
-                print(f"[TimeUpdate] World Time: {world_time}")
+                # print(f"[TimeUpdate] World Time: {world_time}") # Reduced spam
 
             elif pid == 0x05: # Entity Equipment
                 eid = struct.unpack('>i', recv_exact(sock, 4))[0]
@@ -489,22 +503,27 @@ def handle_server(sock):
             elif pid == 0xFF: # Disconnect/Kick
                 msg = read_string_utf16(sock)
                 print(f"[Disconnect] {msg}")
+                chat_queue.put(f"--- Disconnected: {msg} ---")
                 running_client = False # Signal to stop processing packets
                 break # Exit the while loop
             
             else:
                 print(f"[ERROR] Unhandled Packet ID: 0x{pid:02X}. Disconnecting to prevent further issues.")
+                chat_queue.put(f"--- Unhandled Packet 0x{pid:02X}, disconnecting ---")
                 running_client = False # Signal to stop
                 break
 
     except ConnectionError as e:
         print(f"[Connection Error] {e}")
+        chat_queue.put(f"--- Connection Error: {e} ---")
         running_client = False # Signal to stop/reconnect
     except struct.error as e:
         print(f"[Protocol Error] Failed to unpack packet data: {e}. Possible desynchronization or incorrect packet structure assumption.")
+        chat_queue.put(f"--- Protocol Error: {e} ---")
         running_client = False # Signal to stop/reconnect
     except Exception as e:
         print(f"[General Error] {e}")
+        chat_queue.put(f"--- General Error: {e} ---")
         running_client = False # Signal to stop/reconnect
     finally:
         if sock and not sock._closed:
@@ -512,19 +531,20 @@ def handle_server(sock):
             sock.close()
         global_socket = None # Clear global_socket to indicate it's closed
 
+
 def connect_and_manage_bot():
     global global_socket, running_client
 
     while True: # Infinite loop for reconnection
         if not running_client: # Only try to connect if not already running (or just disconnected)
-            print(f"Attempting to connect to {SERVER_HOST}:{SERVER_PORT}...")
+            chat_queue.put(f"--> Attempting to connect to {SERVER_HOST}:{SERVER_PORT}...")
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             global_socket = s
             running_client = True # Set to True while attempting connection and running
 
             try:
                 s.connect((SERVER_HOST, SERVER_PORT))
-                print("Successfully connected.")
+                chat_queue.put("--> Successfully connected.")
 
                 # Handshake (0x02) - Client to Server
                 send_packet(s, 0x02, encode_string_utf16(USERNAME))
@@ -532,9 +552,11 @@ def connect_and_manage_bot():
                 # Read server's handshake response (0x02)
                 pid = recv_packet_id(s)
                 if pid != 0x02:
-                    print(f"[Unexpected] Expected 0x02 Handshake Response, got 0x{pid:02X}. Closing connection.")
+                    msg = f"Expected 0x02 Handshake, got 0x{pid:02X}"
+                    print(f"[Unexpected] {msg}")
+                    chat_queue.put(f"--> {msg}")
                     running_client = False
-                    continue # Try again
+                    continue
 
                 connection_hash = read_string_utf16(s)
                 print(f"[Handshake Response] Server Connection Hash: '{connection_hash}'")
@@ -548,14 +570,13 @@ def connect_and_manage_bot():
                 pid = recv_packet_id(s)
                 if pid == 0x01:
                     # Login Success
-                    global bot_entity_id, bot_dimension # Ensure these are set globally
+                    global bot_entity_id, bot_dimension
                     bot_entity_id = struct.unpack('>i', recv_exact(s, 4))[0]
                     unknown_string = read_string_utf16(s)
                     map_seed = struct.unpack('>q', recv_exact(s, 8))[0]
-                    bot_dimension = struct.unpack('>b', recv_exact(s, 1))[0] # Use bot_dimension
+                    bot_dimension = struct.unpack('>b', recv_exact(s, 1))[0]
                     print(f"[Login Success] EID: {bot_entity_id}, Seed: {map_seed}, Dim: {bot_dimension}")
                     
-                    # Start threads for handling incoming packets and periodic updates
                     server_listener_thread = threading.Thread(target=handle_server, args=(s,))
                     server_listener_thread.daemon = True
                     server_listener_thread.start()
@@ -564,93 +585,145 @@ def connect_and_manage_bot():
                     player_update_thread.daemon = True
                     player_update_thread.start()
                     
-                    # Wait for either the server listener to stop or the running_client flag to become False
                     while running_client and server_listener_thread.is_alive():
                         time.sleep(1)
                     
-                    print("[INFO] Bot disconnected or stopped. Attempting to restart...")
-                    # If running_client became False within handle_server, it means disconnection.
-                    # The loop will then wait RECONNECT_DELAY_SECONDS and try to reconnect.
-
+                    chat_queue.put("--> Bot disconnected or stopped. Attempting to restart...")
+                
                 elif pid == 0xFF:
                     msg = read_string_utf16(s)
                     print(f"[Login Failed] Kicked: {msg}")
-                    running_client = False # Set to False so the outer loop retries
+                    chat_queue.put(f"--> Login Failed: {msg}")
+                    running_client = False
                 else:
-                    print(f"[Unexpected] Expected 0x01 Login or 0xFF Kick, got 0x{pid:02X}. Closing connection.")
-                    running_client = False # Set to False so the outer loop retries
+                    msg = f"Expected 0x01 Login or 0xFF Kick, got 0x{pid:02X}"
+                    print(f"[Unexpected] {msg}")
+                    chat_queue.put(f"--> {msg}")
+                    running_client = False
             
             except ConnectionRefusedError:
-                print("[Error] Connection refused. Retrying...")
+                chat_queue.put("--> Connection refused. Retrying...")
             except ConnectionError as e:
-                print(f"[Connection Error] {e}. Retrying...")
+                chat_queue.put(f"--> Connection Error: {e}. Retrying...")
             except struct.error as e:
-                print(f"[Protocol Error] {e}. Retrying...")
+                chat_queue.put(f"--> Protocol Error: {e}. Retrying...")
             except Exception as e:
-                print(f"[General Error] {e}. Retrying...")
+                chat_queue.put(f"--> General Error: {e}. Retrying...")
             finally:
                 if s and not s._closed:
-                    print("[INFO] Closing socket from connection manager.")
                     s.close()
-                global_socket = None # Ensure global_socket is cleared
-                running_client = False # Ensure running_client is False if an exception occurred
+                global_socket = None
+                running_client = False
 
-        # If not running_client (due to disconnect or initial failure), wait and retry
         if not running_client:
             print(f"Waiting {RECONNECT_DELAY_SECONDS} seconds before reconnecting...")
             time.sleep(RECONNECT_DELAY_SECONDS)
 
-# === Tkinter GUI for Key Input ===
-def on_key_press(event):
-    global bot_x, bot_y, bot_z, bot_stance # Add bot_stance to global
-    with movement_lock: # Protect shared variables during modification
-        if event.keysym == 'w':
-            bot_z += MOVE_DISTANCE
-            print(f"Moving bot North to ({bot_x}, {bot_z})")
-        elif event.keysym == 's':
-            bot_z -= MOVE_DISTANCE
-            print(f"Moving bot South to ({bot_x}, {bot_z})")
-        elif event.keysym == 'a':
-            bot_x += MOVE_DISTANCE # Inverted 'a' (moves right/East)
-            print(f"Moving bot East to ({bot_x}, {bot_z})")
-        elif event.keysym == 'd':
-            bot_x -= MOVE_DISTANCE # Inverted 'd' (moves left/West)
-            print(f"Moving bot West to ({bot_x}, {bot_z})")
-        elif event.keysym == 'space': # Move up
-            bot_y += MOVE_DISTANCE
-            bot_stance = bot_y + 1.62 # Update stance when Y changes
-            print(f"Moving bot Up to Y:{bot_y})")
-        elif event.keysym == 'Shift_L' or event.keysym == 'Shift_R': # Move down
-            # Prevent going below MIN_Y
-            new_y = bot_y - MOVE_DISTANCE
-            if new_y >= MIN_Y:
-                bot_y = new_y
-                bot_stance = bot_y + 1.62 # Update stance when Y changes
-                print(f"Moving bot Down to Y:{bot_y})")
-            else:
-                print(f"Cannot move below MIN_Y ({MIN_Y}). Current Y: {bot_y}")
+# === Tkinter GUI with Chat Implementation (REVISED) ===
+class ChatClientGUI(tk.Frame):
+    def __init__(self, master=None):
+        super().__init__(master)
+        self.master = master
+        self.master.title("Minecraft Bot Controller")
+        self.pack(fill="both", expand=True)
+        self._create_widgets()
+        self._bind_events()
+        self.master.after(100, self._process_chat_queue) # Start checking the queue
+
+    def _create_widgets(self):
+        # Frame for chat display and input
+        chat_frame = tk.Frame(self, borderwidth=2, relief="groove")
+        chat_frame.pack(side="top", fill="both", expand=True, padx=5, pady=5)
+
+        # ScrolledText for receiving messages
+        self.chat_log = scrolledtext.ScrolledText(chat_frame, state='disabled', wrap=tk.WORD, bg="#f0f0f0", fg="black")
+        self.chat_log.pack(side="top", fill="both", expand=True, padx=5, pady=5)
+
+        # Frame for message entry and send button
+        input_frame = tk.Frame(chat_frame)
+        input_frame.pack(side="bottom", fill="x", expand=False, padx=5, pady=(0, 5))
+
+        self.chat_entry = tk.Entry(input_frame)
+        self.chat_entry.pack(side="left", fill="x", expand=True)
+
+        self.send_button = tk.Button(input_frame, text="Send", command=self._send_chat_message)
+        self.send_button.pack(side="right")
+
+        # Label for movement instructions
+        info_label = tk.Label(self, text="Focus this window. Use WASD to move, Space (Up), Shift (Down).")
+        info_label.pack(side="bottom", fill="x", padx=5, pady=(0, 5))
+
+    def _bind_events(self):
+        # Bind movement keys to the master window
+        self.master.bind('<KeyPress-w>', self._on_key_press)
+        self.master.bind('<KeyPress-s>', self._on_key_press)
+        self.master.bind('<KeyPress-a>', self._on_key_press)
+        self.master.bind('<KeyPress-d>', self._on_key_press)
+        self.master.bind('<KeyPress-space>', self._on_key_press)
+        self.master.bind('<KeyPress-Shift_L>', self._on_key_press)
+        self.master.bind('<KeyPress-Shift_R>', self._on_key_press)
+        
+        # Bind Return key in chat entry to send message
+        self.chat_entry.bind('<Return>', self._send_chat_message)
+
+    def _on_key_press(self, event):
+        # FIX #1: Ignore movement if the chat entry is focused
+        if self.master.focus_get() is self.chat_entry:
+            return
+
+        global bot_x, bot_y, bot_z, bot_stance
+        with movement_lock:
+            if event.keysym == 'w':
+                bot_z += MOVE_DISTANCE
+            elif event.keysym == 's':
+                bot_z -= MOVE_DISTANCE
+            elif event.keysym == 'a':
+                bot_x += MOVE_DISTANCE # Inverted 'a'
+            elif event.keysym == 'd':
+                bot_x -= MOVE_DISTANCE # Inverted 'd'
+            elif event.keysym == 'space':
+                bot_y += MOVE_DISTANCE
+                bot_stance = bot_y + 1.62
+            elif event.keysym == 'Shift_L' or event.keysym == 'Shift_R':
+                new_y = bot_y - MOVE_DISTANCE
+                if new_y >= MIN_Y:
+                    bot_y = new_y
+                    bot_stance = bot_y + 1.62
+                else:
+                    print(f"Cannot move below MIN_Y ({MIN_Y}).")
+        print(f"Bot moved. New position: (X: {bot_x:.1f}, Y: {bot_y:.1f}, Z: {bot_z:.1f})")
+
+    def _send_chat_message(self, event=None):
+        message = self.chat_entry.get()
+        if message and global_socket:
+            self.chat_entry.delete(0, tk.END)
+            # Packet 0x03 is used for Client->Server chat as well
+            chat_packet_data = encode_string_utf16(message)
+            send_packet(global_socket, 0x03, chat_packet_data)
+            # FIX #2: REMOVED the line that displayed the message locally
+            # self._display_message(f"<{USERNAME}> {message}") # This line was removed
+
+    def _display_message(self, message):
+        """Safely inserts a message into the chat log."""
+        self.chat_log.configure(state='normal')
+        self.chat_log.insert(tk.END, message + '\n')
+        self.chat_log.configure(state='disabled')
+        self.chat_log.see(tk.END) # Scroll to the bottom
+
+    def _process_chat_queue(self):
+        """Checks the queue for new messages and displays them."""
+        try:
+            while not chat_queue.empty():
+                message = chat_queue.get_nowait()
+                self._display_message(message)
+        finally:
+            self.master.after(100, self._process_chat_queue) # Schedule the next check
 
 def start_gui():
     root = tk.Tk()
-    root.title("Minecraft Bot Controller")
-    root.geometry("300x100")
-
-    label = tk.Label(root, text="Press WASD, Space (Up), Shift (Down) to move the bot.")
-    label.pack(pady=20)
-
-    # Bind key press events to the window
-    root.bind('<w>', on_key_press)
-    root.bind('<s>', on_key_press)
-    root.bind('<a>', on_key_press)
-    root.bind('<d>', on_key_press)
-    root.bind('<space>', on_key_press) # Bind space key
-    root.bind('<Shift_L>', on_key_press) # Bind left shift key
-    root.bind('<Shift_R>', on_key_press) # Bind right shift key
-
-    # Optional: Focus the window to ensure key presses are captured immediately
-    root.focus_force()
-
-    root.mainloop()
+    root.geometry("500x350")
+    app = ChatClientGUI(master=root)
+    app.mainloop()
 
 if __name__ == "__main__":
     # Start the bot connection and management in a separate thread
